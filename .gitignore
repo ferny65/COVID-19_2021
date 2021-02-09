@@ -43,3 +43,5 @@ vignettes/*.pdf
 
 #other files
 *.jar
+.DS_Store
+*.zip

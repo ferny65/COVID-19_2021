@@ -1,0 +1,29 @@
+---
+title: "leerdatos"
+author: "Fernando Lopez Irarragorri"
+date: "10/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+data_mexico<-read.csv("current_data_mexico_preprocessed.csv", header=TRUE, sep = ",",stringsAsFactors = FALSE)
+head(data_mexico,10)
+str(data_mexico)
+```
+```{r}
+ColstoRemove <-c(1,2,3,4,5,6,7,8,9,10,11,15:39)
+data_mexico_simplified <- data_mexico[,-ColstoRemove]
+str(data_mexico_simplified)
+```
+
+

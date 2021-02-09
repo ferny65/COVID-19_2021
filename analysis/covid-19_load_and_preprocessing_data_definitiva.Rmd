@@ -1,0 +1,275 @@
+---
+title: "COVID-19"
+author: "Fernando Lopez Irarragorri"
+date: "21/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+1. Loading required libraries
+```{r}
+#Código tomado de: https://towardsdatascience.com/an-efficient-way-to-install-and-load-r-packages-bc53247f058d
+packages <- c("readxl","plyr","DescTools","stringi","rlist","data.table","writexl", "foreach","parallel")
+# Install packages not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+# Packages loading
+invisible(lapply(packages, library, character.only = TRUE))
+```
+2. Setup environment
+```{r eval=FALSE}
+#Setup working dir
+#workdir<-"/Volumes/Users/Usuarios/fernandolopez/Dropbox/COVID-19-PROYECTO"
+#workingdir <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#setwd(workdir)
+```
+3. Catalogos (valores nominales escalas variables)
+```{r}
+#----------------Reading data--------------------------------
+#Reading excel sheets from file Catalogos_071020.xlsx
+xl_catalogos<-"Catalogos_071020.xlsx"
+tab_names <- excel_sheets(path = xl_catalogos)
+catalogos <- lapply(tab_names, function(x) read_excel(path = xl_catalogos, sheet = x,))
+str(catalogos)
+```
+```{r}
+#Fixing tab names and asigning to catalogos
+fixed_tabs<-lapply(tab_names, function(x) {substr(x,10, nchar(x))})
+fixed_tabs[9]<-substr(fixed_tabs[9],4, nchar(fixed_tabs[9]))
+print("fixed_tabs->")
+fixed_tabs<-unlist(fixed_tabs)
+sprintf("%s",fixed_tabs)
+names(catalogos) <- fixed_tabs
+names(catalogos)
+```
+
+```{r}
+#-----------------Pre-Processing "catalogos"-----------------
+#Standarizing fields names in catalogos
+for (c in 1:length(catalogos)) {
+  namesc <- names(catalogos[[c]])
+  namesc[namesc == "DESCRIPCIÓN"] <- "DESCRIPCION"
+  names(catalogos[[c]])<-namesc
+}
+#install.packages("writexl")
+#library(writexl)
+names(catalogos$CLASIFICACION_FINAL) <- c("CLAVE","DESCRIPCION","DESCRIPCION2")
+names(catalogos$ENTIDADES) <- c("CLAVE","DESCRIPCION","ABREVIATURA")
+names(catalogos$MUNICIPIOS) <-c("CLAVE","DESCRIPCION","ENTIDAD") 
+
+new_catalogos <- catalogos
+new_catalogos$MUNICIPIOS$CLAVE <- as.integer(new_catalogos$MUNICIPIOS$CLAVE)
+new_catalogos$MUNICIPIOS$ENTIDAD <- as.integer(new_catalogos$MUNICIPIOS$ENTIDAD)
+str(new_catalogos)
+
+fixed_catalogos_file_name <- "fixed_catalogos.xlsx"
+write_xlsx(new_catalogos, fixed_catalogos_file_name)
+```
+
+4. Descriptores (dicionarios)
+```{r}
+#----------------Reading data--------------------------------
+#Reading field descriptors from file Descriptores_071020.xlsx
+xl_descriptores<-"Descriptores_071020.xlsx"
+descriptores<-read_excel(xl_descriptores,1)
+```
+
+```{r}
+#Removing string "CATÁLOGO: " or "CATALÓGO: " from field "FORMATO O FUENTE"
+descriptores$`FORMATO O FUENTE`<-lapply(descriptores$`FORMATO O FUENTE`,function(x){if (substring(x,1,10) == "CATÁLOGO: " || substring(x,1,10) == "CATALÓGO: ") {substring(x,11,nchar(x))} else {x}})
+str(descriptores)
+```
+```{r}
+#Fixing descriptors
+#adding new col with variable formats
+descriptores$FORMATOS <- unlist(descriptores$`FORMATO O FUENTE`)
+#deleting col "FORMATO O FUENTE"
+descriptores <- descriptores[,-4]
+descriptores$FORMATOS[descriptores$FORMATOS == "SI_ NO"] <- "SI_NO" 
+descriptores$FORMATOS[descriptores$FORMATOS %like% "TEXTO%"]<-"TEXTO"
+descriptores$FORMATOS[descriptores$FORMATOS == "NÚMERICA EN AÑOS"] <- "NUMERICO"
+#fixing invalid var name
+descriptores$`NOMBRE DE VARIABLE`[descriptores$`NOMBRE DE VARIABLE`=="OTRAS_COM"] <- "OTRA_COM"
+```
+```{r}
+#adding new variables that will be added to data_mexico
+added_numbers <- c(39,40,41)
+added_cols <- c("DIAS_SINTOMAS_INGRESO","DIAS_INGRESO_FALLECIMIENTO","DIAS_SINTOMAS_FALLECIMIENTO")
+added_formats <- c("DIFFTIME","DIFFTIME","DIFFTIME")
+mm <- as.data.frame(cbind(added_numbers,added_cols,c("","",""),added_formats),stringsAsFactors = FALSE)
+names(mm) <- names(descriptores)
+descriptores <- as.data.frame(rbind(descriptores, mm))
+```
+```{r}
+#preparing for mappings
+dSI_NO <- descriptores$FORMATOS == "SI_NO"
+dFECHA <- descriptores$FORMATOS == "AAAA-MM-DD"
+dENTIDADES <- descriptores$FORMATOS == "ENTIDADES"
+dMUNICIPIOS <- descriptores$FORMATOS == "MUNICIPIOS"
+dTEXTO <- descriptores$FORMATOS == "TEXTO"
+dDIFFTIME <- descriptores$FORMATOS == "DIFFTIME"
+dNUMERICO <- descriptores$FORMATOS == "NUMERICO"
+dOTRAS <- !(dSI_NO | dFECHA | dTEXTO | dENTIDADES | dDIFFTIME | dNUMERICO | dMUNICIPIOS)
+varFormatos <- list(dSI_NO,dENTIDADES, dOTRAS)
+names(varFormatos) <- c("SI_NO","ENTIDADES","OTRAS")
+```
+5. Obtener datos actuales México (fecha actual o hasta dos dias anteriores si no esta disponible) 
+
+```{r}
+#----------------Reading data--------------------------------
+createActualDataFileName(corr){
+#Construye el nombre del fichero que se cargará
+    #One day before today, in  case of error use ...<-Sys.Date() instead, or <-Sys.Date()-2
+    actual_data_date <- Sys.Date() - corr
+    return(stri_replace_all_fixed(
+          paste(substr(actual_data_date,3,4),
+          substr(actual_data_date,6,7),
+          substr(actual_data_date,9,10),
+          "COVID19MEXICO.csv")," ",""))
+}
+```
+```{r}
+getMostRecentData <- function(x,corr=0){
+#Obtiene los datos mas recientes desde la dirección x, si no existen aplica corrección días anteriores
+            temp <- tempfile()
+            download.file(x,temp)
+            actual_data_file_name <-createActualDataFileName(corr) 
+            data_mexicox<-read.csv(unz(temp,actual_data_file_name), header=TRUE, sep = ",",stringsAsFactors = FALSE)
+            unlink(temp)
+            return (data_mexicox)
+}
+```
+```{r}
+#implementing try-catch for getting the most actual COVID-19 data
+#Código tomado de: https://stackoverflow.com/questions/12193779/how-to-write-trycatch-in-r
+getData <- function(x,c){
+    out <- tryCatch(
+        expr = { return (getMostRecentData(x,c))},
+        error = function(e){
+          actual_data_date <- actual_data_date <- Sys.Date() - c
+          msg <- paste("No se pudieron cargar los datos de ", as.character(actual_data_date))
+          message(msg)
+          print(e)
+          return(NULL)
+        },
+        warning = function(w){
+            message('Caught an warning!')
+            print(w)
+            return(NULL)
+        },
+        finally = {
+            message('All done, quitting.')
+        }
+    ) 
+    return (out)
+}
+```
+```{r}
+#Código tomado de: https://stackoverflow.com/questions/3053833/using-r-to-download-zipped-data-file-extract-and-import-data
+#Reading COVID-19 data (Mexico)
+actual_data<-"http://datosabiertos.salud.gob.mx/gobmx/salud/datos_abiertos/datos_abiertos_covid19.zip"
+correction <- 0
+data_mexico <- NULL
+while (correction < 3 & is.null(data_mexico) ){
+  data_mexico <- getData(actual_data,correction)
+  correction <- correction +1
+}
+if (is.null(data_mexico)) 
+  stop(paste("ERROR: no se pudieron cargar los datos deesde ",actual_data))
+head(data_mexico,10)
+str(data_mexico)
+actual_data_file_name <- createActualDataFileName(correction)
+write.csv(data_mexico,file=actual_data_file_name)
+```
+
+```{r}
+#----------------Pre-Processing "data_mexico"----------------
+#Convert date fields to difference in days
+data_mexico$FECHA_INGRESO <- as.Date(data_mexico$FECHA_INGRESO)
+data_mexico$FECHA_SINTOMAS <- as.Date(data_mexico$FECHA_SINTOMAS)
+data_mexico$FECHA_DEF[data_mexico$FECHA_DEF=="9999-99-99"] <- "01-01-1970"
+data_mexico$FECHA_DEF <- as.Date(data_mexico$FECHA_DEF)
+data_mexico$DIAS_SINTOMAS_INGRESO <- difftime(data_mexico$FECHA_INGRESO, data_mexico$FECHA_SINTOMAS, units = "days")
+data_mexico$DIAS_INGRESO_FALLECIMIENTO <- difftime(data_mexico$FECHA_DEF, data_mexico$FECHA_INGRESO, units = "days")
+data_mexico$DIAS_SINTOMAS_FALLECIMIENTO <-difftime(data_mexico$FECHA_DEF, data_mexico$FECHA_SINTOMAS, units = "days") 
+#data_mexico <-lapply(data,factor)
+```
+
+```{r}
+#Remapping columns
+for (nc in names(varFormatos)) {
+    nv <- descriptores$`NOMBRE DE VARIABLE`[unlist(varFormatos[nc])]
+  for (c in nv ){
+    newv <- paste("de",c,sep = "")
+    data_mexico[,newv] <- NA
+    if (nc != "OTRAS"){
+      data_mexico[,newv] <- mapvalues(data_mexico[,c], from = as.integer(as.character(catalogos[[nc]]$CLAVE)), to = as.character(catalogos[[nc]]$DESCRIPCION))
+    } 
+    else {
+      data_mexico[,newv] <- mapvalues(data_mexico[,c], from = as.integer(as.character(catalogos[[c]]$CLAVE)), to = as.character(catalogos[[c]]$DESCRIPCION))
+    }
+  
+  }
+}
+data_mexico_file_name <- "data_mexico_parcial.csv"
+write.csv(data_mexico,data_mexico_file_name)
+```
+```{r}
+#---------------------------III.CREAR COLUMNA DE DESCRIPTORES DE MUNICIPIOS ------------
+entidades_municipios_unicas <- unique(data_mexico[,c("MUNICIPIO_RES","ENTIDAD_RES","deMUNICIPIOS")])
+#....3.1 Crear nueva columna para los desciptores de los municipios
+data_mexico$deMUNICIPIOS <- NA
+for(irow in 1:nrow(data_mexico)) {
+  mr <- data_mexico$MUNICIPIO_RES[irow]
+  er <- data_mexico$ENTIDAD_RES[irow]
+  if (nrow(new_catalogos$MUNICIPIOS[new_catalogos$MUNICIPIOS$CLAVE == mr & new_catalogos$MUNICIPIOS$ENTIDAD == er,]) >0)
+    data_mexico$deMUNICIPIOS[irow] <- new_catalogos$DESCRIPCION[new_catalogos$CLAVE==mr & new_catalogos$ENTIDAD == er]
+}
+
+```
+
+#6. Particionar conjunto de datos para trabajar en dos computadoras simultaneamente
+#```{r}
+#data_mexico_ordered <- data_mexico[order(data_mexico$deENTIDAD_RES ),]
+#Particionar datos para procesamiento paralelo
+#rows_by_entity_sorted <- sort(table(data_mexico_ordered$deENTIDAD_RES))
+#entities_a_1 <- names(rows_by_entity_sorted[seq(1, 15, 2)])
+#entities_a_2 <- names(rows_by_entity_sorted[seq(17, 32, 2)])
+##entities_b_1 <- names(rows_by_entity_sorted[seq(2, 16, 2)])
+#entities_b_2 <- names(rows_by_entity_sorted[seq(18, 33, 2)])
+
+#Crear listas para pdocesamiento distribuido en dos computadoras
+#entities_a <- c(entities_a_1,entities_a_2)
+#entities_b <- c(entities_b_1,entities_b_2)
+
+#Particionar conjunto de datos en dos listas
+#data_mexico_a <- data_mexico[data_mexico$deENTIDAD_RES %in% entities_a,]
+#data_mexico_b <- data_mexico[data_mexico$deENTIDAD_RES %in% entities_b,]
+
+#Salvar datos de las listas en dos ficheros de datos 
+#data_mexico_a_filename <- "datos_mexico_parcial_a.csv"
+#data_mexico_b_filename <- "datos_mexico_parcial_b.csv"
+
+#write.csv(data_mexico_a,data_mexico_a_filename)
+#write.csv(data_mexico_b,data_mexico_b_filename)
+
+
+#```
+
+#```{r eval=FALSE}
+#data_municipios <- c()
+#for (m in 1:length(data_mexico$deMUNICIPIOS)){
+#    data_municipios[m] <- data_mexico$deMUNICIPIOS[[m]]
+#  if (length(data_mexico$deMUNICIPIOS[[m]]) > 0){
+#  }
+#}
+#  else data_municipios[m] <- NA
+#data_mexico$deMUNICIPIOS <- data_municipios
+#actual_data_file_name_preprocessed <- "current_data_mexico_preprocessed.csv"
+#write.csv(data_mexico,file=actual_data_file_name_preprocessed)
+#```
